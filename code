@@ -1,0 +1,173 @@
+drop table other_diags_concat;
+drop table FINAL_ATRIALFIB;
+drop table diags1;
+drop table ATRIALFIB;
+drop table OTHER_DIAGNOSES;
+
+create volatile table ATRIALFIB as (
+     select p.person_ID AS Person_ID
+			  ,p.name_full_formatted as Full_Name
+			  ,cvsex.display AS Sex
+			  ,(current_date - cast(P.BIRTH_DT_TM as date))year AS Age
+			  ,cast(E.REG_DT_TM as DATE) as Admission_Date 
+			  ,cast(E.REG_DT_TM as TIME) as Admission_Time
+			  ,cast(E.DEPART_DT_TM as DATE) as Discharge_Date 
+			  ,cast(E.DEPART_DT_TM as TIME) as Discharge_Time
+			  ,cast(P.BIRTH_DT_TM as DATE) AS Date_Of_Birth
+			  ,n.SOURCE_IDENTIFIER AS AF_Code
+			  ,n.source_string AS AF_Description
+     		  ,x.FCLTY_NAME AS Facility_Name
+			  ,e.encntr_ID
+			  ,case when CVbed.display NE '0' then CVbed.display else 'Unknown' end as Bed_Nmbr 
+			  ,case when CVroom.display NE '0' then CVroom.display else 'Unknown' end as Room_Nmbr
+			  ,case when cvnurse.display NE '0' then cvnurse.display else 'Unknown' end AS NurseUnit_Nmbr
+
+			  from	CERNER.ENCOUNTER e
+
+              inner join LOOKUP.FACILITY_XREF_LKUP x /*Get Cerner facility*/
+                     ON x.Cerner_Facility_Nmbr = e.Loc_Facility_Cd
+                     and x.Parent_Fl = 1
+					 and x.Crnt_Flag = 'Y'
+ 	   		  inner join CERNER.PERSON p                   /*Get person details */
+                     on e.PERSON_ID = p.PERSON_ID
+                     and p.End_Effective_Dt_Tm > CURRENT_TIMESTAMP
+                     and p.Active_Ind = 1 and p.App_Source_Id = 200
+	   		  inner join CERNER.CODE_VALUE cvsex                   /*Get sex*/
+                     on p.Sex_cd = cvsex.Code_Value
+                     and cvsex.Active_Ind = 1 and cvsex.App_Source_Id = 200
+			  inner join CERNER.DIAGNOSIS d						/* Get Diagnosis */
+					 on d.ENCNTR_ID = e.Encntr_Id
+					 and d.End_Effective_Dt_Tm > CURRENT_TIMESTAMP
+                     and d.Active_Ind = 1 and d.App_Source_Id = 200
+			  inner join CERNER.NOMENCLATURE n					/*Get ICD10 codes */
+					 on n.NOMENCLATURE_ID = D.NOMENCLATURE_ID
+					 and n.End_Effective_Dt_Tm > CURRENT_TIMESTAMP
+                     and n.Active_Ind = 1 and n.App_Source_Id = 200	 
+			  left join CERNER.ENCNTR_LOC_HIST lh					/*Get location codes */
+					 on E.ENCNTR_ID = lh.ENCNTR_ID
+					 and lh.End_Effective_Dt_Tm > CURRENT_TIMESTAMP
+                     and lh.Active_Ind = 1 and lh.App_Source_Id = 200
+			  left join CERNER.CODE_VALUE cvbed					/*Get BED codes */
+					 on lh.LOC_BED_CD = cvbed.CODE_VALUE
+					 and cvbed.Active_Ind = 1 and cvbed.App_Source_Id = 200
+			  left join CERNER.CODE_VALUE cvroom					/*Get room codes */
+					 on lh.LOC_ROOM_CD = cvroom.CODE_VALUE
+					 and cvroom.Active_Ind = 1 and cvroom.App_Source_Id = 200
+  			  left join CERNER.CODE_VALUE cvnurse					/*Get Nurse Unit codes */
+					 on lh.LOC_NURSE_UNIT_CD = cvnurse.CODE_VALUE
+					 and cvnurse.Active_Ind = 1 and cvnurse.App_Source_Id = 200
+
+
+		where 1=1
+		and n.SOURCE_IDENTIFIER in ('I48','I48.0','I48.2','I48.4','I48.9','I48.91')
+		and E.REG_DT_TM >= cast((current_timestamp - cast('48' as interval hour)) as timestamp)
+		and E.REG_DT_TM <= current_timestamp
+		and x.XREF_DSPLY_KEY IN ('BUMCT','BUMCS')
+        and e.End_Effective_Dt_Tm > current_timestamp
+        and e.Active_Ind = 1 and e.App_Source_Id = 200
+        ) with data on commit preserve rows;
+
+CREATE multiset VOLATILE TABLE OTHER_DIAGNOSES AS
+		(
+		select  a.Person_ID
+				,a.Full_Name 
+				,n.source_string AS AF_Description
+				,n.SOURCE_IDENTIFIER as AF_Code
+				,a.encntr_ID 
+
+		from ATRIALFIB A
+
+			  INNER JOIN  cerner.DIAGNOSIS d						/* Get Diagnosis */
+					 on d.ENCNTR_ID = a.Encntr_Id
+					 and d.End_Effective_Dt_Tm > current_timestamp
+                     and d.Active_Ind = 1 and d.App_Source_Id = 200
+			  inner join CERNER.NOMENCLATURE n						/*Get ICD10 codes */
+					 on n.NOMENCLATURE_ID = D.NOMENCLATURE_ID
+					 and n.End_Effective_Dt_Tm > current_timestamp
+                     and n.Active_Ind = 1 and n.App_Source_Id = 200	
+
+		where 1=1
+		and n.SOURCE_IDENTIFIER NOT in ('I48','I48.0','I48.2','I48.4','I48.9','I48.91')
+		)  with data on commit preserve rows ;
+
+
+CREATE VOLATILE TABLE other_diags_concat AS
+ (
+   SELECT
+       o.Person_ID
+      ,o.Full_Name
+      ,o.AF_Description
+      ,o.AF_Code
+      ,o.ENCNTR_ID
+      ,ROW_NUMBER()
+       OVER (PARTITION BY ENCNTR_ID
+             ORDER BY o.Full_Name) AS rn -- reverse order!
+      ,COUNT(*)
+       OVER (PARTITION BY ENCNTR_ID) AS cnt
+   FROM OTHER_DIAGNOSES o
+ ) WITH DATA 
+UNIQUE PRIMARY INDEX(ENCNTR_ID, rn)
+ON COMMIT PRESERVE ROWS;
+
+create volatile table diags1 as (
+WITH RECURSIVE cte
+(ENCNTR_ID, list1, list2, rn, Person_ID, Full_Name) AS
+ (SELECT
+      ENCNTR_ID
+      ,CAST(AF_Description AS VARCHAR(1000))
+      ,CAST(AF_Code AS VARCHAR(1000))		-- define maximum size based on maximum number of rows 
+      ,rn
+      ,Person_ID
+      ,Full_Name
+   FROM other_diags_concat
+   WHERE rn = cnt
+
+   UNION ALL
+
+   SELECT
+      other_diags_concat.ENCNTR_ID
+      ,cte.list1 || '; ' || other_diags_concat.AF_Description
+      ,cte.list2 || '; ' || other_diags_concat.AF_Code
+      ,other_diags_concat.rn
+      ,other_diags_concat.Person_ID
+      ,other_diags_concat.Full_Name
+   FROM other_diags_concat
+   JOIN cte
+   ON other_diags_concat.ENCNTR_ID = cte.ENCNTR_ID
+   AND other_diags_concat.rn = cte.rn - 1)
+   
+SELECT Person_ID, Full_Name, ENCNTR_ID, list1 as All_Diagnoses_Description, list2 as All_Diagnoses_ICD
+FROM cte
+WHERE rn = 1) with data on commit preserve rows;
+
+
+CREATE volatile TABLE FINAL_ATRIALFIB AS
+		(
+		select  a.Person_ID
+				,a.Full_Name
+				,a.Age
+				,a.Sex
+				,a.Admission_Date (date, format 'dd-mmm-yyyy') (CHAR(12)) as Admission_Date
+			    ,a.Admission_Time (time, format 'hh:mi') (CHAR(6)) as Admission_Time
+			    ,a.Discharge_Date (date, format 'dd-mmm-yyyy') (CHAR(12)) as Discharge_Date
+			    ,a.Discharge_Time (time, format 'hh:mi') (CHAR(6)) as Discharge_Time
+			    ,a.Date_Of_Birth  (date, format 'dd-mmm-yyyy') (CHAR(12)) as Date_Of_Birth
+			    ,a.AF_Code
+			    ,a.AF_Description
+     		    ,a.Facility_Name
+				,a.Bed_Nmbr
+			    ,a.Room_Nmbr
+			    ,a.NurseUnit_Nmbr
+				,o.All_Diagnoses_ICD
+				,o.All_Diagnoses_Description
+
+		from ATRIALFIB A
+		
+		left join diags1 O
+		on a.encntr_ID = o.encntr_ID )
+		
+		with data ON COMMIT PRESERVE ROWS ;
+		
+SELECT * FROM FINAL_ATRIALFIB;
+
+
